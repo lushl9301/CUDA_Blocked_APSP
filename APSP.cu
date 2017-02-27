@@ -4,11 +4,13 @@
 #include <sys/time.h>
 
 #include <cuda_runtime.h>
-
+#include <cuda_profiler_api.h>
 #include "APSP.cuh"
 
-#define BLKSZ 32
-#define ROUND 10
+#define BLKSZ_1 32
+#define BLKSZ_2 32
+#define BLKSZ_3 32
+#define ROUND 6
 
 #define gpuErrchk(ans) { gpuAssert((ans), __FILE__, __LINE__); }
 inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=true)
@@ -21,16 +23,11 @@ inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=t
 }
 
 
-__global__ void wake_gpu_kernel()
-{
-	;
-	return;
-}
 
 __global__ void floyd_kernel_1(int k, int *devMat, int N)
 {
-	__shared__ int d_d[BLKSZ][BLKSZ];
-	int base = k * BLKSZ;
+	__shared__ int d_d[BLKSZ_1][BLKSZ_1];
+	int base = k * BLKSZ_1;
 	int i = threadIdx.y;
 	int j = threadIdx.x;
 	int d_i = i + base;
@@ -40,7 +37,7 @@ __global__ void floyd_kernel_1(int k, int *devMat, int N)
 	__syncthreads();
 
 	int newD;
-	for (int t = 0; t < BLKSZ; t++) {
+	for (int t = 0; t < BLKSZ_1; t++) {
 		newD = d_d[i][t] + d_d[t][j];
 		if (newD < d_d[i][j])
 			d_d[i][j] = newD;
@@ -52,36 +49,36 @@ __global__ void floyd_kernel_2(int k, int *devMat, int N)
 {
 	if (blockIdx.x == k) return;
 
-	__shared__ int d_d[BLKSZ][BLKSZ], d_c[BLKSZ][BLKSZ];
-	int base = k * BLKSZ;	
+	__shared__ int d_d[BLKSZ_2][BLKSZ_2], d_c[BLKSZ_2][BLKSZ_2];
+	int base = k * BLKSZ_2;
 	int i = threadIdx.y;
 	int j = threadIdx.x;
 
 	int d_i = i + base;
 	int d_j = j + base;
 	base = d_i * N + d_j;
-	d_d[i][j] = devMat[base];
+	d_d[i][j] = devMat[base]; // (k,k) matrix
 
 	if (blockIdx.y == 0) {
-		d_j = BLKSZ * blockIdx.x + threadIdx.x;
+		d_j = BLKSZ_2 * blockIdx.x + threadIdx.x;
 	} else {
-		d_i = BLKSZ * blockIdx.x + threadIdx.y;
+		d_i = BLKSZ_2 * blockIdx.x + threadIdx.y;
 	}
 
 	int current_base = d_i * N + d_j;
-	d_c[i][j] = devMat[current_base];
+	d_c[i][j] = devMat[current_base]; // updating matrix
 	__syncthreads();
 	
 	int newD;
 
 	if (blockIdx.y == 0) {
-		for (int t = 0; t < BLKSZ; t++) {
+		for (int t = 0; t < BLKSZ_2; t++) {
 			newD = d_d[i][t] + d_c[t][j];
 			if (newD < d_c[i][j])
 				d_c[i][j] = newD;
 		}
 	} else {
-		for (int t = 0; t < BLKSZ; t++) {
+		for (int t = 0; t < BLKSZ_2; t++) {
 			newD = d_c[i][t] + d_d[t][j];
 			if (newD < d_c[i][j])
 				d_c[i][j] = newD;
@@ -91,17 +88,17 @@ __global__ void floyd_kernel_2(int k, int *devMat, int N)
 	devMat[current_base] = d_c[i][j];
 }
 
+
 __global__ void floyd_kernel_3(int k, int *devMat, int N)
 {
 	if (blockIdx.x == k || blockIdx.y == k) return;
 	
-	__shared__ int d_c[BLKSZ][BLKSZ], d_r[BLKSZ][BLKSZ];
-	int base = k * BLKSZ;
+	__shared__ int d_c[BLKSZ_3][BLKSZ_3], d_r[BLKSZ_3][BLKSZ_3];
+	int base = k * BLKSZ_3;
 	int d_i = blockDim.y * blockIdx.y + threadIdx.y;
 	int d_j = blockDim.x * blockIdx.x + threadIdx.x;
 	int i = threadIdx.y;
 	int j = threadIdx.x;
-	
 	int col_base = (base + i) * N + d_j;
 	int row_base = d_i * N + base + j; 
 	base = d_i * N + d_j;
@@ -111,7 +108,7 @@ __global__ void floyd_kernel_3(int k, int *devMat, int N)
 	int oldD = devMat[base];
 	__syncthreads();
 	int newD;
-	for (int t = 0; t < BLKSZ; t++) {
+	for (int t = 0; t < BLKSZ_3; t++) {
 		newD = d_c[i][t] + d_r[t][j];
 		if (newD < oldD)
 			oldD = newD;
@@ -122,18 +119,21 @@ __global__ void floyd_kernel_3(int k, int *devMat, int N)
 
 int floyd(int* devMat, int N)
 {
-	int N_blk = N / BLKSZ;
-	
-	dim3 gridSizeP2(N / BLKSZ, 2);
-	dim3 gridSizeP3(N / BLKSZ, N / BLKSZ);
-	
-	dim3 blockSize(BLKSZ, BLKSZ);
-	
+	int N_blk = N / BLKSZ_1;
 
+	dim3 blockSize1(BLKSZ_1, BLKSZ_1);
+
+	dim3 gridSizeP2(N / BLKSZ_2, 2);
+	dim3 blockSize2(BLKSZ_2, BLKSZ_2);
+
+	dim3 gridSizeP3(N / BLKSZ_3, N / BLKSZ_3);
+	dim3 blockSize3(BLKSZ_3, BLKSZ_3);
  	for (int k = 0; k < N_blk; k++) {
-		floyd_kernel_1 <<<1, blockSize>>> (k, devMat, N);
-		floyd_kernel_2 <<<gridSizeP2, blockSize>>> (k, devMat, N);
-		floyd_kernel_3 <<<gridSizeP3, blockSize>>> (k, devMat, N);
+		cudaProfilerStart();
+		floyd_kernel_1 <<<1, blockSize1>>> (k, devMat, N);
+		floyd_kernel_2 <<<gridSizeP2, blockSize2>>> (k, devMat, N);
+		cudaProfilerStop();
+		floyd_kernel_3 <<<gridSizeP3, blockSize3>>> (k, devMat, N);
 	}
 
 	gpuErrchk(cudaPeekAtLastError());
@@ -169,10 +169,9 @@ int main(int argc, char* argv[])
 			exit(-1);
 		}
 	}
-	
-	dim3 dummy(BLKSZ, BLKSZ);
-	wake_gpu_kernel<<<1, dummy>>>();
-	gpuErrchk(cudaPeekAtLastError());
+	int ttt;
+	cudaGetDeviceCount(&ttt);
+	printf("device number = %d\n", ttt);
 
 	mat = (int *)malloc(N * N * sizeof(int));
 	ref = (int *)malloc(sizeof(int) * N * N);
@@ -186,16 +185,18 @@ int main(int argc, char* argv[])
 		diff1 = 1000000 * (end.tv_sec-start.tv_sec) + (end.tv_nsec-start.tv_nsec)/1000;
 	}
 
-
 	cudaMallocManaged(&result, N * N * sizeof(int));
-	memcpy(result, mat, sizeof(int) * N * N);
+	cudaMemcpy(result, mat, sizeof(int) * N * N, cudaMemcpyHostToDevice);
+	diff2 = 0;
+	floyd(result, N);
+	floyd(result, N);
 	for (int i = 0; i < ROUND; i++) {
 		clock_gettime(CLOCK_MONOTONIC, &start);
 		floyd(result, N);
 		cudaDeviceSynchronize();
 		clock_gettime(CLOCK_MONOTONIC, &end);
 		diff2 = 1000000 * (end.tv_sec-start.tv_sec) + (end.tv_nsec-start.tv_nsec)/1000;
-		printf("CUDA_APSP elasped time = %.2lf us\n", diff2 / ROUND);
+		printf("%d Problem SIZE ------ CUDA_APSP elasped time =%.2lfus\n", N, diff2);
 	}
 	if (flag) {
 		if (CmpArray(result, ref, N * N))
