@@ -7,7 +7,7 @@
 #include <cstdio>
 #include <cuda_fp16.h>
 #include <assert.h>
-#include "fp16_conversion.h"
+//#include "fp16_conversion.h"
 
 #include <cuda_runtime.h>
 #include <cuda_profiler_api.h>
@@ -30,9 +30,9 @@ inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=t
 
 
 
-__global__ void floyd_kernel_1(int k, half *devMat, int N)
+__global__ void floyd_kernel_1(int k, float *devMat, int N)
 {
-	__shared__ half d_d[BLKSZ_1][BLKSZ_1];
+	__shared__ float d_d[BLKSZ_1][BLKSZ_1];
 	int base = k * BLKSZ_1;
 	int i = threadIdx.y;
 	int j = threadIdx.x;
@@ -42,20 +42,20 @@ __global__ void floyd_kernel_1(int k, half *devMat, int N)
 	d_d[i][j] = devMat[base];
 	__syncthreads();
 
-	half newD;
+	float newD;
 	for (int t = 0; t < BLKSZ_1; t++) {
-		newD = __hadd(d_d[i][t], d_d[t][j]);
-		if (__hlt(newD, d_d[i][j]))
+		newD = d_d[i][t] + d_d[t][j];
+		if (newD < d_d[i][j])
 			d_d[i][j] = newD;
 	}
 	devMat[base] = d_d[i][j];
 }
 
-__global__ void floyd_kernel_2(int k, half *devMat, int N)
+__global__ void floyd_kernel_2(int k, float *devMat, int N)
 {
 	if (blockIdx.x == k) return;
 
-	__shared__ half d_d[BLKSZ_2][BLKSZ_2], d_c[BLKSZ_2][BLKSZ_2];
+	__shared__ float d_d[BLKSZ_2][BLKSZ_2], d_c[BLKSZ_2][BLKSZ_2];
 	int base = k * BLKSZ_2;
 	int i = threadIdx.y;
 	int j = threadIdx.x;
@@ -75,18 +75,18 @@ __global__ void floyd_kernel_2(int k, half *devMat, int N)
 	d_c[i][j] = devMat[current_base]; // updating matrix
 	__syncthreads();
 
-	half newD;
+	float newD;
 
 	if (blockIdx.y == 0) {
 		for (int t = 0; t < BLKSZ_2; t++) {
-			newD = __hadd(d_d[i][t], d_c[t][j]);
-			if (__hlt(newD, d_c[i][j]))
+			newD = d_d[i][t] + d_c[t][j];
+			if (newD < d_c[i][j])
 				d_c[i][j] = newD;
 		}
 	} else {
 		for (int t = 0; t < BLKSZ_2; t++) {
-			newD = __hadd(d_c[i][t], d_d[t][j]);
-			if (__hlt(newD, d_c[i][j]))
+			newD = d_c[i][t] + d_d[t][j];
+			if (newD < d_c[i][j])
 				d_c[i][j] = newD;
 		}
 	}
@@ -95,11 +95,11 @@ __global__ void floyd_kernel_2(int k, half *devMat, int N)
 }
 
 
-__global__ void floyd_kernel_3(int k, half *devMat, int N)
+__global__ void floyd_kernel_3(int k, float *devMat, int N)
 {
 	if (blockIdx.x == k || blockIdx.y == k) return;
 
-	__shared__ half d_c[BLKSZ_3][BLKSZ_3], d_r[BLKSZ_3][BLKSZ_3];
+	__shared__ float d_c[BLKSZ_3][BLKSZ_3], d_r[BLKSZ_3][BLKSZ_3];
 	int base = k * BLKSZ_3;
 	int d_i = blockDim.y * blockIdx.y + threadIdx.y;
 	int d_j = blockDim.x * blockIdx.x + threadIdx.x;
@@ -111,19 +111,19 @@ __global__ void floyd_kernel_3(int k, half *devMat, int N)
 
 	d_r[i][j] = devMat[col_base];
 	d_c[i][j] = devMat[row_base];
-	half oldD = devMat[base];
+	float oldD = devMat[base];
 	__syncthreads();
-	half newD;
+	float newD;
 	for (int t = 0; t < BLKSZ_3; t++) {
-		newD = __hadd(d_c[i][t], d_r[t][j]);
-		if (__hlt(newD, oldD))
+		newD = d_c[i][t] + d_r[t][j];
+		if (newD < oldD)
 			oldD = newD;
 	}
 	devMat[base] = oldD;
 }
 
 
-int floyd(half* devMat, int N)
+int floyd(float* devMat, int N)
 {
 	int N_blk = N / BLKSZ_1;
 
@@ -152,7 +152,7 @@ int main(int argc, char* argv[])
 	int N;
 	int flag = 0;
 	int *mat, *ref;
-	half *result;
+	float *result;
 	struct timespec start, end;
 	double diff1, diff2;
 
@@ -192,11 +192,11 @@ int main(int argc, char* argv[])
 		diff1 = 1000000 * (end.tv_sec-start.tv_sec) + (end.tv_nsec-start.tv_nsec)/1000;
 	}
 
-	cudaMallocManaged(&result, N * N * sizeof(half));
+	cudaMallocManaged(&result, N * N * sizeof(float));
 //	cudaMemcpy(result, mat, sizeof(int) * N * N, cudaMemcpyHostToDevice);
 	for (int i = 0; i < N; i++) {
 		for (int j = 0; j < N; j++) {
-			result[i * N + j] = approx_float_to_half((float)(mat[i * N + j]));
+			result[i * N + j] = (float)(mat[i * N + j]);
 		}
 	}
 
@@ -214,7 +214,7 @@ int main(int argc, char* argv[])
 	if (flag) {
 		for (int i = 0; i < N; i++) {
 			for (int j = 0; j < N; j++) {
-				mat[i* N + j] = (int)half_to_float(result[i* N + j]);
+				mat[i* N + j] = (int)result[i* N + j];
 			}
 		}
 		if (CmpArray(mat, ref, N * N))
